@@ -11,7 +11,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
@@ -32,6 +34,8 @@ type GuildPlayer struct {
 	queue    []string
 	ytClient youtube.Client
 	stopChan chan struct{}
+	members  []string
+	mx       sync.RWMutex
 }
 
 func main() {
@@ -46,6 +50,49 @@ func main() {
 		return
 	}
 	dg.AddHandler(messageCreate)
+	dg.AddHandler(func(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
+		g, ok := MusicPlayerInstance.GuildPlayers[vs.GuildID]
+		if !ok {
+			return
+		}
+		if vs.BeforeUpdate == nil || vs.Member.User.Bot {
+			return
+		}
+		g.mx.RLock()
+		// if the user is not in the voice channel before the update and is in the voice channel after the update
+		if vs.BeforeUpdate.ChannelID != g.vc.ChannelID && vs.ChannelID == g.vc.ChannelID {
+
+			sort.Slice(g.members, func(i, j int) bool {
+				return g.members[i] < g.members[j]
+			})
+			_, found := sort.Find(len(g.members), func(i int) int {
+				if g.members[i] == vs.UserID {
+					return 0
+				}
+				return 1
+			})
+			if !found {
+				g.mx.Lock()
+				g.members = append(g.members, vs.UserID)
+				g.mx.Unlock()
+			}
+		}
+		g.mx.RUnlock()
+		// if the user is in the voice channel before the update and is not in the voice channel after the update
+		if vs.BeforeUpdate.ChannelID == g.vc.ChannelID && vs.ChannelID != g.vc.ChannelID {
+			g.mx.Lock()
+			for i, member := range g.members {
+				if member == vs.UserID {
+					g.members = append(g.members[:i], g.members[i+1:]...)
+					break
+				}
+			}
+			g.mx.Unlock()
+		}
+		if len(g.members) <= 1 {
+			g.stopChan <- struct{}{}
+		}
+	})
 	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsGuildVoiceStates
 	err = dg.Open()
 	if err != nil {
@@ -79,7 +126,10 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 					s.ChannelMessageSendReply(m.ChannelID, "Error getting video ID", m.Reference())
 					return
 				}
-				if guild, ok := MusicPlayerInstance.GuildPlayers[g.ID]; ok {
+				guild, ok := MusicPlayerInstance.GuildPlayers[g.ID]
+				if ok {
+					guild.mx.Lock()
+					defer guild.mx.Unlock()
 					guild.queue = append(guild.queue, id)
 					return
 				}
@@ -87,6 +137,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 					queue:    []string{id},
 					ytClient: youtube.Client{},
 					stopChan: make(chan struct{}),
+					mx:       sync.RWMutex{},
 				}
 				go MusicPlayerInstance.GuildPlayers[g.ID].StartPlayer(s, g.ID, vs.ChannelID)
 				return
@@ -112,16 +163,31 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 func (g *GuildPlayer) StartPlayer(s *discordgo.Session, guildID, channelID string) (err error) {
+	g.mx.Lock()
 	g.vc, err = s.ChannelVoiceJoin(guildID, channelID, false, true)
 	defer func() {
+		g.mx.Lock()
 		g.vc.Disconnect()
 		g.vc.Close()
 		close(g.stopChan)
 		delete(MusicPlayerInstance.GuildPlayers, guildID)
+		g.mx.Unlock()
 	}()
 	if err != nil {
+		g.mx.Unlock()
 		return err
 	}
+	ch, err := s.Channel(g.vc.ChannelID)
+	if err != nil {
+		fmt.Println("Error getting channel: ", err)
+		g.mx.Unlock()
+		return
+	}
+	g.members = []string{}
+	for _, member := range ch.Members {
+		g.members = append(g.members, member.UserID)
+	}
+	g.mx.Unlock()
 	for len(g.queue) > 0 {
 		err = g.playSound(s, channelID)
 		if err != nil {
