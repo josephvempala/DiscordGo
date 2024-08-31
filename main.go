@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -30,74 +30,22 @@ var MusicPlayerInstance = &MusicPlayer{
 type MusicPlayer struct {
 	GuildPlayers map[string]*GuildPlayer
 }
-type VoiceUpdateBroker struct {
-	listeners []chan string
-	mx        sync.RWMutex
-}
-
 type GuildPlayer struct {
-	vc             *discordgo.VoiceConnection
-	queue          []string
-	ytClient       youtube.Client
-	members        []string
-	vcUpdateBroker VoiceUpdateBroker
-	mx             sync.RWMutex
+	vc              *discordgo.VoiceConnection
+	vcMx            sync.Mutex
+	members         []string
+	queue           []string
+	status          int
+	statusCondition *sync.Cond
+	ytClient        youtube.Client
 }
 
-func (v *VoiceUpdateBroker) ClearListeners() {
-	defer func() {
-		if err := recover(); err != nil {
-			if erro, ok := err.(error); ok && erro.Error() == "close of closed channel" {
-				return
-			}
-		}
-	}()
-	for _, l := range v.listeners {
-		close(l)
-		return
-	}
-}
-
-func (v *VoiceUpdateBroker) BroadcastVoiceUpdate(update string) {
-	v.mx.Lock()
-	defer v.mx.Unlock()
-	for _, listener := range v.listeners {
-		go func(listener chan string) {
-			select {
-			case listener <- update:
-			case <-time.After(1 * time.Second):
-				return
-			}
-		}(listener)
-	}
-}
-
-func (v *VoiceUpdateBroker) GetVoiceUpdateListener() <-chan string {
-	v.mx.Lock()
-	defer v.mx.Unlock()
-	listener := make(chan string)
-	v.listeners = append(v.listeners, listener)
-	return listener
-}
-
-func (v *VoiceUpdateBroker) ClearVoiceUpdateListener(listener <-chan string) {
-	defer func() {
-		if err := recover(); err != nil {
-			if erro, ok := err.(error); ok && erro.Error() == "send on closed channel" {
-				return
-			}
-		}
-	}()
-	v.mx.Lock()
-	defer v.mx.Unlock()
-	for i, l := range v.listeners {
-		if l == listener {
-			v.listeners = append(v.listeners[:i], v.listeners[i+1:]...)
-			close(l)
-			return
-		}
-	}
-}
+const (
+	MP_STATUS_IDLE = iota
+	MP_STATUS_PLAYING
+	MP_STATUS_STOPPED
+	MP_STATUS_ENDED
+)
 
 func main() {
 	token := os.Getenv("TOKEN")
@@ -112,7 +60,10 @@ func main() {
 	}
 	dg.AddHandler(messageCreate)
 	dg.AddHandler(onVoiceStateUpdate)
-	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsGuildVoiceStates
+	dg.Identify.Intents = discordgo.IntentsGuilds |
+		discordgo.IntentsGuildMessages |
+		discordgo.IntentsGuildVoiceStates |
+		discordgo.IntentsGuildMembers
 	err = dg.Open()
 	if err != nil {
 		fmt.Println("Error opening Discord session: ", err)
@@ -130,50 +81,95 @@ func onVoiceStateUpdate(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
 		return
 	}
 	if vs.Member.User.Bot {
+		// if the bot is issuing commands to itself do nothing
+		if vs.Member.User.ID != s.State.User.ID {
+			return
+		}
+		// if bot has been forcibly disconnected from the voice channel, clear the associated guild player
+		if g.vc != nil && vs.ChannelID != g.vc.ChannelID && vs.ChannelID == "" {
+			g.ClearGuildPlayer()
+		}
 		return
 	}
 	// if the user is not in the voice channel before the update and is in the voice channel after the update
 	if (vs.BeforeUpdate == nil && vs.ChannelID == g.vc.ChannelID) ||
 		(vs.BeforeUpdate.ChannelID != g.vc.ChannelID && vs.ChannelID == g.vc.ChannelID) {
-		sort.Slice(g.members, func(i, j int) bool {
-			return g.members[i] < g.members[j]
-		})
-		_, found := sort.Find(len(g.members), func(i int) int {
-			if g.members[i] == vs.UserID {
-				return 0
-			}
-			return 1
-		})
+		index, found := slices.BinarySearch(g.members, vs.UserID)
 		if !found {
-			g.mx.Lock()
-			g.members = append(g.members, vs.UserID)
-			g.mx.Unlock()
-			if len(g.members) > 0 {
-				g.vcUpdateBroker.BroadcastVoiceUpdate("User joined voice channel")
-			}
+			g.vcMx.Lock()
+			g.members = slices.Insert(g.members, index, vs.UserID)
+			g.vcMx.Unlock()
+			g.OnUserJoinVoiceChannel()
 		}
 	}
 	// if the user is in the voice channel before the update and is not in the voice channel after the update
 	if vs.BeforeUpdate != nil && vs.BeforeUpdate.ChannelID == g.vc.ChannelID && vs.ChannelID != g.vc.ChannelID {
 		for i, member := range g.members {
 			if member == vs.UserID {
-				g.mx.Lock()
-				g.members = append(g.members[:i], g.members[i+1:]...)
-				g.mx.Unlock()
+				g.vcMx.Lock()
+				g.members = slices.Delete(g.members, i, i+1)
+				g.vcMx.Unlock()
 				break
 			}
 		}
-		if len(g.members) <= 0 {
-			g.vcUpdateBroker.BroadcastVoiceUpdate("No members in voice channel")
-		}
+		g.OnUserLeaveVoiceChannel()
 	}
+}
+
+func (g *GuildPlayer) OnUserJoinVoiceChannel() {
+	if g.vc == nil {
+		return
+	}
+	if len(g.members) == 1 {
+		g.vc.Speaking(true)
+		g.SetPlayerState(MP_STATUS_PLAYING)
+	}
+}
+
+func (g *GuildPlayer) OnUserLeaveVoiceChannel() {
+	if g.vc == nil {
+		return
+	}
+	if len(g.members) == 0 {
+		g.vc.Speaking(false)
+		g.SetPlayerState(MP_STATUS_STOPPED)
+	}
+}
+
+func (g *GuildPlayer) SetPlayerState(state int) {
+	g.vcMx.Lock()
+	defer g.vcMx.Unlock()
+	if g.vc == nil {
+		return
+	}
+	g.status = state
+	g.statusCondition.Broadcast()
+	if state == MP_STATUS_STOPPED {
+		timer := time.NewTimer(5 * time.Second)
+		go func() {
+			<-timer.C
+			if g.status == MP_STATUS_STOPPED {
+				g.SetPlayerState(MP_STATUS_ENDED)
+			}
+		}()
+	}
+}
+
+func (g *GuildPlayer) ClearGuildPlayer() {
+	g.vcMx.Lock()
+	defer g.vcMx.Unlock()
+	if g.vc != nil {
+		g.vc.Disconnect()
+		g.vc.Close()
+	}
+	delete(MusicPlayerInstance.GuildPlayers, g.vc.GuildID)
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if m.Author.ID == s.State.User.ID {
 		return
 	}
-	if strings.HasPrefix(m.Content, "-p") {
+	if strings.HasPrefix(m.Content, "+p") {
 		c, err := s.State.Channel(m.ChannelID)
 		if err != nil {
 			return
@@ -192,24 +188,33 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 				}
 				guild, ok := MusicPlayerInstance.GuildPlayers[g.ID]
 				if ok {
-					guild.mx.Lock()
+					// if the user is not in the same voice channel as the bot
+					if guild.vc != nil && vs.ChannelID != guild.vc.ChannelID {
+						s.ChannelMessageSendReply(m.ChannelID, "You need to be in the same voice channel as the bot to use this command.", m.Reference())
+						return
+					}
+					guild.vcMx.Lock()
 					guild.queue = append(guild.queue, id)
-					guild.mx.Unlock()
-					guild.vcUpdateBroker.BroadcastVoiceUpdate("User requested play")
+					guild.vcMx.Unlock()
+					guild.SetPlayerState(MP_STATUS_PLAYING)
 					return
 				}
-				MusicPlayerInstance.GuildPlayers[g.ID] = &GuildPlayer{
+				members := []string{}
+				for _, guildVcMembers := range g.VoiceStates {
+					// if voice channel is that of bot and user is not the bot
+					if guildVcMembers.ChannelID == vs.ChannelID && guildVcMembers.UserID != s.State.User.ID {
+						members = append(members, guildVcMembers.UserID)
+					}
+				}
+				mp := &GuildPlayer{
 					queue:    []string{id},
 					ytClient: youtube.Client{},
-					mx:       sync.RWMutex{},
-					vcUpdateBroker: struct {
-						listeners []chan string
-						mx        sync.RWMutex
-					}{
-						listeners: make([]chan string, 0),
-						mx:        sync.RWMutex{},
-					},
+					vcMx:     sync.Mutex{},
+					members:  members,
+					status:   MP_STATUS_IDLE,
 				}
+				mp.statusCondition = sync.NewCond(&mp.vcMx)
+				MusicPlayerInstance.GuildPlayers[g.ID] = mp
 				go MusicPlayerInstance.GuildPlayers[g.ID].StartPlayer(s, g.ID, vs.ChannelID, m.ChannelID)
 				return
 			}
@@ -226,7 +231,11 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			return
 		}
 		if guild, ok := MusicPlayerInstance.GuildPlayers[g.ID]; ok {
-			guild.vcUpdateBroker.BroadcastVoiceUpdate("User requested stop")
+			if guild.status == MP_STATUS_PLAYING {
+				guild.SetPlayerState(MP_STATUS_STOPPED)
+				return
+			}
+			guild.SetPlayerState(MP_STATUS_PLAYING)
 			return
 		}
 		s.ChannelMessageSendReply(m.ChannelID, "No audio is currently playing in this guild.", m.Reference())
@@ -234,42 +243,31 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 func (g *GuildPlayer) StartPlayer(s *discordgo.Session, guildID, voiceChannel string, messageChannel string) (err error) {
-	g.mx.Lock()
+	g.vcMx.Lock()
 	g.vc, err = s.ChannelVoiceJoin(guildID, voiceChannel, false, true)
-	defer func() {
-		g.mx.Lock()
-		g.vc.Disconnect()
-		g.vc.Close()
-		delete(MusicPlayerInstance.GuildPlayers, guildID)
-		g.vcUpdateBroker.ClearListeners()
-		g.mx.Unlock()
-	}()
+	defer g.ClearGuildPlayer()
 	if err != nil {
-		g.mx.Unlock()
+		g.vcMx.Unlock()
 		return err
 	}
-	g.mx.Unlock()
+	g.vcMx.Unlock()
 	for len(g.queue) > 0 {
 		err = g.playSound(s, messageChannel)
 		if err != nil {
 			fmt.Println("Error playing sound: in StartPlayer", err)
 			return err
 		}
-		if len(g.queue) == 0 && g.vc.Ready {
-			i := true
-			updateListener := g.vcUpdateBroker.GetVoiceUpdateListener()
-			for i {
-				select {
-				case update := <-updateListener:
-					if update == "User requested play" {
-						i = false
-					}
-				case <-time.After(1 * time.Minute):
-					g.vcUpdateBroker.ClearVoiceUpdateListener(updateListener)
+		if len(g.queue) == 0 {
+			g.SetPlayerState(MP_STATUS_STOPPED)
+			g.vcMx.Lock()
+			for g.status != MP_STATUS_PLAYING {
+				g.statusCondition.Wait()
+				if g.status == MP_STATUS_ENDED {
+					g.vcMx.Unlock()
 					return
 				}
 			}
-			g.vcUpdateBroker.ClearVoiceUpdateListener(updateListener)
+			g.vcMx.Unlock()
 		}
 	}
 	return nil
@@ -290,7 +288,7 @@ func (g *GuildPlayer) playSound(s *discordgo.Session, channelID string) (err err
 	stream, _, err := g.ytClient.GetStream(video, &formats[0])
 	if err != nil {
 		fmt.Println("Error getting audio stream: ", err)
-		go s.ChannelMessageSend(channelID, "Error getting audio stream")
+		s.ChannelMessageSend(channelID, "Error getting audio stream")
 		return err
 	}
 	defer stream.Close()
@@ -298,7 +296,7 @@ func (g *GuildPlayer) playSound(s *discordgo.Session, channelID string) (err err
 	ffmpegout, err := run.StdoutPipe()
 	if err != nil {
 		fmt.Println("Error receiving converted audio stream ", err)
-		go s.ChannelMessageSend(channelID, "Error while receiving converted audio stream")
+		s.ChannelMessageSend(channelID, "Error while receiving converted audio stream")
 		return err
 	}
 	defer ffmpegout.Close()
@@ -306,33 +304,31 @@ func (g *GuildPlayer) playSound(s *discordgo.Session, channelID string) (err err
 	err = run.Start()
 	if err != nil {
 		fmt.Println("Error starting FFmpeg: ", err)
-		go s.ChannelMessageSend(channelID, "Error while starting stream transformer")
+		s.ChannelMessageSend(channelID, "Error while starting stream transformer")
 		panic(err)
 	}
 	defer run.Process.Kill()
 	g.vc.Speaking(true)
 	defer g.vc.Speaking(false)
+	g.SetPlayerState(MP_STATUS_PLAYING)
+	defer g.SetPlayerState(MP_STATUS_STOPPED)
 	send := make(chan []int16, 960*2)
-	wg := sync.WaitGroup{}
-	ctx, cancel := context.WithCancel(context.Background())
-	complete := make(chan struct{})
+	finishedPlaying := make(chan struct{})
 	go func() {
-		SendPCM(ctx, g.vc, send, &wg)
-		complete <- struct{}{}
+		g.SendPCM(g.vc, send)
+		finishedPlaying <- struct{}{}
 	}()
-	go s.ChannelMessageSend(channelID, fmt.Sprintf("Now playing: %s", video.Title))
+	s.ChannelMessageSend(channelID, fmt.Sprintf("Now playing: %s", video.Title))
 	defer func() {
 		if err := recover(); err != nil {
 			if erro, ok := err.(error); ok && erro.Error() == "send on closed channel" {
 				return
 			}
 			fmt.Println("Error playing sound: ", err)
-			go s.ChannelMessageSend(channelID, "Error playing sound")
+			s.ChannelMessageSend(channelID, "Error playing sound")
 		}
 		g.queue = g.queue[1:]
 	}()
-	vcUpdateListener := g.vcUpdateBroker.GetVoiceUpdateListener()
-	defer g.vcUpdateBroker.ClearVoiceUpdateListener(vcUpdateListener)
 	for {
 		audiobuf := make([]int16, 960*2)
 		err = binary.Read(ffmpegbuf, binary.LittleEndian, &audiobuf)
@@ -345,47 +341,17 @@ func (g *GuildPlayer) playSound(s *discordgo.Session, channelID string) (err err
 			send <- nil
 			break
 		}
-		wg.Wait()
 		select {
-		case update := <-vcUpdateListener:
-			if update == "No members in voice channel" {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					select {
-					case update = <-vcUpdateListener:
-						if update == "User joined voice channel" {
-							go s.ChannelMessageSend(channelID, "Resuming audio.")
-							return
-						}
-					case <-time.After(1 * time.Minute):
-						go s.ChannelMessageSend(channelID, "No members in voice channel. Stopping audio.")
-						cancel()
-						return
-					}
-				}()
-			}
-			if update == "User requested stop" {
-				cancel()
-				return
-			}
-		default:
-			timer := time.NewTimer(50 * time.Millisecond)
-			select {
-			case <-timer.C:
-				cancel()
-				return nil
-			case send <- audiobuf:
-				timer.Reset(50 * time.Millisecond)
-			}
+		case <-finishedPlaying:
+			return nil
+		case send <- audiobuf:
 		}
 	}
-	<-complete
-	cancel()
+	<-finishedPlaying
 	return nil
 }
 
-func SendPCM(ctx context.Context, v *discordgo.VoiceConnection, pcm <-chan []int16, wg *sync.WaitGroup) {
+func (g *GuildPlayer) SendPCM(v *discordgo.VoiceConnection, pcm <-chan []int16) {
 	if pcm == nil {
 		return
 	}
@@ -395,31 +361,32 @@ func SendPCM(ctx context.Context, v *discordgo.VoiceConnection, pcm <-chan []int
 		return
 	}
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			recv, ok := <-pcm
-			if !ok || recv == nil {
+		g.vcMx.Lock()
+		for g.status != MP_STATUS_PLAYING {
+			if g.status == MP_STATUS_ENDED || g.status == MP_STATUS_STOPPED {
+				g.vcMx.Unlock()
 				return
 			}
-			wg.Wait()
-			opus, err := opusEncoder.Encode(recv, 960, 960*2)
-			if err != nil {
-				fmt.Println("Error encoding PCM: ", err)
+			g.statusCondition.Wait()
+			if g.status == MP_STATUS_ENDED || g.status == MP_STATUS_STOPPED {
+				g.vcMx.Unlock()
 				return
-			}
-			if !v.Ready || v.OpusSend == nil {
-				return
-			}
-			timer := time.NewTimer(50 * time.Millisecond)
-			select {
-			case <-timer.C:
-				return
-			case v.OpusSend <- opus:
-				timer.Reset(50 * time.Millisecond)
 			}
 		}
+		g.vcMx.Unlock()
+		recv, ok := <-pcm
+		if !ok || recv == nil {
+			return
+		}
+		opus, err := opusEncoder.Encode(recv, 960, 960*2)
+		if err != nil {
+			fmt.Println("Error encoding PCM: ", err)
+			return
+		}
+		if !v.Ready || v.OpusSend == nil {
+			return
+		}
+		v.OpusSend <- opus
 	}
 }
 
@@ -431,7 +398,7 @@ func GetYoutubeVideoID(query string) (string, error) {
 			return res[0][1], nil
 		}
 	}
-	result, err := http.Get("https://www.youtube.com/results?search_query=" + url.QueryEscape(query+" audio"))
+	result, err := http.Get("https://www.youtube.com/results?search_query=" + url.QueryEscape(query))
 	if err != nil {
 		return "", err
 	}
