@@ -145,7 +145,7 @@ func (g *GuildPlayer) SetPlayerState(state int) {
 	g.status = state
 	g.statusCondition.Broadcast()
 	if state == MP_STATUS_STOPPED {
-		timer := time.NewTimer(5 * time.Second)
+		timer := time.NewTimer(5 * time.Minute)
 		go func() {
 			<-timer.C
 			if g.status == MP_STATUS_STOPPED {
@@ -169,7 +169,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if m.Author.ID == s.State.User.ID {
 		return
 	}
-	if strings.HasPrefix(m.Content, "+p") {
+	if strings.HasPrefix(m.Content, "-p") {
 		c, err := s.State.Channel(m.ChannelID)
 		if err != nil {
 			return

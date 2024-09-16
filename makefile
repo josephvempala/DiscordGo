@@ -1,3 +1,5 @@
+include .env
+export
 # Go compiler
 GO := go
 
