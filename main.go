@@ -25,10 +25,16 @@ import (
 
 var MusicPlayerInstance = &MusicPlayer{
 	make(map[string]*GuildPlayer),
+	0,
+	sync.Mutex{},
+	nil,
 }
 
 type MusicPlayer struct {
-	GuildPlayers map[string]*GuildPlayer
+	GuildPlayers      map[string]*GuildPlayer
+	Count             uint64
+	mu                sync.Mutex
+	discordConnection *discordgo.Session
 }
 type GuildPlayer struct {
 	vc              *discordgo.VoiceConnection
@@ -68,6 +74,7 @@ func main() {
 	if err != nil {
 		fmt.Println("Error opening Discord session: ", err)
 	}
+	MusicPlayerInstance.discordConnection = dg
 	fmt.Println("Bot is now running. Press CTRL-C to exit.")
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
@@ -162,7 +169,16 @@ func (g *GuildPlayer) ClearGuildPlayer() {
 		g.vc.Disconnect()
 		g.vc.Close()
 	}
+	MusicPlayerInstance.mu.Lock()
 	delete(MusicPlayerInstance.GuildPlayers, g.vc.GuildID)
+	MusicPlayerInstance.Count--
+	if MusicPlayerInstance.Count == 0 {
+		MusicPlayerInstance.discordConnection.Close()
+		MusicPlayerInstance.mu.Unlock()
+		g.vcMx.Unlock()
+		os.Exit(1)
+	}
+	MusicPlayerInstance.mu.Unlock()
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -214,7 +230,10 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 					status:   MP_STATUS_IDLE,
 				}
 				mp.statusCondition = sync.NewCond(&mp.vcMx)
+				MusicPlayerInstance.mu.Lock()
 				MusicPlayerInstance.GuildPlayers[g.ID] = mp
+				MusicPlayerInstance.Count++
+				MusicPlayerInstance.mu.Unlock()
 				go MusicPlayerInstance.GuildPlayers[g.ID].StartPlayer(s, g.ID, vs.ChannelID, m.ChannelID)
 				return
 			}
@@ -284,7 +303,7 @@ func (g *GuildPlayer) playSound(s *discordgo.Session, channelID string) (err err
 	sort.Slice(formats, func(i, j int) bool {
 		return formats[i].ItagNo > formats[j].ItagNo
 	})
-	run := exec.Command("ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1")
+	run := exec.Command("ffmpeg", "-i", "pipe:0", "-analyzeduration", "0", "-loglevel", "0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1")
 	stream, _, err := g.ytClient.GetStream(video, &formats[0])
 	if err != nil {
 		fmt.Println("Error getting audio stream: ", err)
